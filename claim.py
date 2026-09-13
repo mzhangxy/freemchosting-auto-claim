@@ -46,7 +46,7 @@ REWARDS_URL = DASH + '/rewards'
 
 USERNAME = os.environ.get('MC_USERNAME', '')
 PASSWORD = os.environ.get('MC_PASSWORD', '')
-PROXY = os.environ.get('CLAIM_PROXY', '')  # 可选住宅代理, 如 http://user:pass@ip:port
+PROXY = os.environ.get('PROXY', '') 
 MAX_ROUNDS = int(os.environ.get('MAX_ROUNDS', '3') or '3')
 LOOT_MAX = int(os.environ.get('LOOT_MAX_SECONDS', '600') or '600')
 DRY_RUN = os.environ.get('DRY_RUN', '0') == '1'
