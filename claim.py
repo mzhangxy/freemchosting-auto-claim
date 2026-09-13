@@ -97,8 +97,12 @@ def build_page():
     if chrome:
         co.set_browser_path(chrome)
     if PROXY:
-        co.set_proxy(PROXY)
         log('🌐 使用代理: ' + PROXY)
+        if PROXY.lower().startswith('socks'):
+            # DrissionPage 的 set_proxy 不支持 socks (会被静默忽略), 直接用 Chrome 参数
+            co.set_argument('--proxy-server=' + PROXY)
+        else:
+            co.set_proxy(PROXY)
     co.auto_port(True)
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-dev-shm-usage')
@@ -580,6 +584,9 @@ def run_lootlabs(page, tab):
     last_claim_click = 0.0
     cont_throttle = [0.0]
     popup_throttle = [0.0]
+    blocked_first = 0.0
+    blocked_last_reload = 0.0
+    blocked_reloads = 0
     last_diag = 0.0
     last_shot = 0.0
 
@@ -670,6 +677,32 @@ def run_lootlabs(page, tab):
             prev_idle = idle_total
 
         now = time.time()
+
+        # ---- LootLabs 对数据中心 IP 返回 "Packet blocked": 刷新重试, 持续被屏蔽则判定出口 IP 被拉黑 ----
+        ptxt = page_snippet(scopes[0], 400)
+        if 'Packet blocked' in ptxt:
+            if not blocked_first:
+                blocked_first = now
+                log('⚠️ LootLabs 提示 Packet blocked (浏览器出口 IP 疑似被屏蔽)')
+            if blocked_reloads < 2 and now - blocked_last_reload > 45:
+                blocked_reloads += 1
+                blocked_last_reload = now
+                log('🔁 刷新 LootLabs 页面重试 (' + str(blocked_reloads) + '/2)')
+                try:
+                    tab.get(cur)
+                except Exception:
+                    try:
+                        tab.refresh()
+                    except Exception:
+                        pass
+                last_progress = time.time()
+                continue
+            if blocked_reloads >= 2 and now - blocked_first > 150:
+                log('❌ LootLabs 持续屏蔽出口 IP (节点出口为数据中心 IP 会被拉黑), 结束本轮')
+                return 'fail'
+        else:
+            blocked_first = 0.0
+
         if now - last_diag > 30:
             last_diag = now
             log('📊 idle=%s spin=%s' % (idle_total, spin_total))
@@ -952,6 +985,14 @@ def main():
 
     log('🚀 启动 (MAX_ROUNDS=' + str(MAX_ROUNDS) + ', DRY_RUN=' + str(DRY_RUN) + ')')
     page = build_page()
+    if PROXY:
+        # 确认浏览器真的走了代理 (DrissionPage 会静默忽略不支持的代理类型)
+        try:
+            page.get('https://api.ipify.org')
+            time.sleep(3)
+            log('🌍 浏览器出口 IP: ' + page_snippet(page, 80))
+        except Exception as e:
+            log('⚠️ 出口 IP 检查失败: ' + str(e))
     try:
         last_err = None
         for attempt in range(1, 4):
