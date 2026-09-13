@@ -1,0 +1,60 @@
+name: Auto Claim Credits
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_rounds:
+        description: '领取轮数'
+        required: false
+        default: '2'
+  schedule:
+    # 每 3 小时运行一次 (UTC 时间, GitHub 定时任务可能有几分钟延迟)
+    - cron: '41 */3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: claim-credits
+  cancel-in-progress: false
+
+jobs:
+  claim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Chrome / xvfb / deps
+        run: |
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            wget -qO- https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+            sudo apt-get update
+            sudo apt-get install -y google-chrome-stable
+          fi
+          google-chrome --version
+          sudo apt-get install -y xvfb
+          pip install -r requirements.txt
+
+      - name: Run auto claim
+        env:
+          MC_USERNAME: ${{ secrets.MC_USERNAME }}
+          MC_PASSWORD: ${{ secrets.MC_PASSWORD }}
+          MAX_ROUNDS: ${{ github.event.inputs.max_rounds || '2' }}
+        run: xvfb-run -a --server-args="-screen 0 1360x900x24" python claim.py
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_id }}
+          path: screenshots/
+          if-no-files-found: ignore
+          retention-days: 7
