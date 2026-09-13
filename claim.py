@@ -66,10 +66,9 @@ def human_pause():
 
 
 def page_snippet(scope, n=400):
-    try:
-        return re.sub(r'\s+', ' ', (scope.text or ''))[:n]
-    except Exception:
-        return ''
+    # 该站点用 DP 自带的 .text 取不到内容, 直接用 JS 读 innerText
+    v = js_run(scope, "return (document.body && document.body.innerText) || '';")
+    return re.sub(r'\s+', ' ', (v or ''))[:n]
 
 
 # ---------------------------------------------------------------------------
@@ -545,29 +544,27 @@ def run_lootlabs(page, tab):
 # Rewards 页面领取一轮
 # ---------------------------------------------------------------------------
 
+TAG_BTN_JS = r"""
+const wanted = (arguments[0] || '').toUpperCase();
+document.querySelectorAll('[data-dp-claim-target]')
+        .forEach(e => e.removeAttribute('data-dp-claim-target'));
+const els = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+const el = els.find(e => e.offsetParent !== null &&
+                         (e.textContent || '').trim().toUpperCase().includes(wanted));
+if (!el) return false;
+el.setAttribute('data-dp-claim-target', '1');
+return true;
+"""
+
+
 def find_btn_by_text(scope, text):
-    """优先找可见的 button/a 标签, 其次任意可见元素, 供真实点击"""
+    """该站点的 DP 文本定位器失效, 用 JS 按文本找到按钮并打标记, 再用 CSS 定位做真实点击"""
+    if not js_bool(scope, TAG_BTN_JS, text):
+        return None
     try:
-        els = scope.eles('text_:' + text)
+        return scope.ele('css:[data-dp-claim-target="1"]', timeout=5)
     except Exception:
         return None
-    best = None
-    for el in (els or []):
-        try:
-            if el.tag in ('button', 'a') and el.states.is_displayed:
-                best = el
-                break
-        except Exception:
-            continue
-    if best is None:
-        for el in reversed(els or []):
-            try:
-                if el.states.is_displayed:
-                    best = el
-                    break
-            except Exception:
-                continue
-    return best
 
 
 def claim_round(page):
@@ -578,12 +575,17 @@ def claim_round(page):
     time.sleep(2)
 
     gen = find_btn_by_text(page, 'Generate reward')
-    if not gen:
-        log('ℹ️ 未找到 "Generate reward" 按钮 (可能冷却中)。页面文本: ' + page_snippet(page))
+    if gen:
+        human_pause()
+        try:
+            gen.click()
+        except Exception:
+            js_click_btn_with_text(page, 'Generate reward')
+    elif not js_click_btn_with_text(page, 'Generate reward'):
+        log('ℹ️ 未找到 "Generate reward" 按钮 (可能冷却中)。URL: ' + (page.url or ''))
+        log('页面文本: ' + page_snippet(page, 500))
         shot(page, 'rewards_no_generate')
         return False
-    human_pause()
-    gen.click()
     log('🪙 已点击 Generate reward')
 
     start = None
@@ -592,12 +594,18 @@ def claim_round(page):
         start = find_btn_by_text(page, 'Start reward')
         if start:
             break
+    if start:
+        human_pause()
+        try:
+            start.click()
+        except Exception:
+            if not js_click_btn_with_text(page, 'Start reward'):
+                start = None
     if not start:
-        log('ℹ️ 未出现 "Start reward" 按钮。页面文本: ' + page_snippet(page))
+        log('ℹ️ 未出现 "Start reward" 按钮。URL: ' + (page.url or ''))
+        log('页面文本: ' + page_snippet(page, 500))
         shot(page, 'rewards_no_start')
         return False
-    human_pause()
-    start.click()
     log('🚀 已点击 Start reward, 等待 LootLabs 页面打开...')
 
     loot_tab = None
