@@ -6,7 +6,8 @@
   1. 打开 https://dash.freemchosting.com/login, 填写账号密码
   2. 处理 Cloudflare Turnstile (点击验证框, 等待 cf-turnstile-response token)
   3. 点击 Sign in 登录
-  4. 进入 /rewards: 点击 Generate reward -> Start reward
+  4. 进入 /rewards: 页面上的 Cloudflare Turnstile 先通过验证,
+     再点击 Generate reward -> (如再次出现验证同样先通过) Start reward
   5. 处理 LootLabs 任务流:
      - 任务行带 "~50 sec." 等时长标注 -> 点击后弹出的广告页保持 7 秒再关闭,
        等任务在标注时间内自动完成 (正常 50~180 秒, 上限 240 秒)
@@ -46,7 +47,8 @@ REWARDS_URL = DASH + '/rewards'
 
 USERNAME = os.environ.get('MC_USERNAME', '')
 PASSWORD = os.environ.get('MC_PASSWORD', '')
-PROXY = os.environ.get('CLAIM_PROXY', '') 
+# workflow 传的是 PROXY(sing-box socks5 入站), 保留 CLAIM_PROXY 兼容旧配置
+PROXY = os.environ.get('CLAIM_PROXY') or os.environ.get('PROXY', '')
 MAX_ROUNDS = int(os.environ.get('MAX_ROUNDS', '3') or '3')
 LOOT_MAX = int(os.environ.get('LOOT_MAX_SECONDS', '600') or '600')
 DRY_RUN = os.environ.get('DRY_RUN', '0') == '1'
@@ -327,6 +329,17 @@ def wait_turnstile(scope, total=90, tag='Turnstile'):
     ok = bool(get_turnstile_token(scope))
     log(('✅ ' if ok else '⚠️ ') + tag + (' 通过' if ok else ' 未通过(超时)'))
     return ok
+
+
+def turnstile_ready(scope, tag, total=100):
+    """提交前保证可提交: 组件还没渲染就等它出现; 没有组件或已有 token 直接通过"""
+    for _ in range(4):
+        if turnstile_present(scope):
+            break
+        time.sleep(2)
+    if not turnstile_present(scope) or get_turnstile_token(scope):
+        return True
+    return wait_turnstile(scope, total=total, tag=tag)
 
 
 # ---------------------------------------------------------------------------
@@ -807,39 +820,82 @@ def claim_round(page):
     log('🧭 打开 Rewards 页面: ' + REWARDS_URL)
     page.get(REWARDS_URL)
     time.sleep(4)
-    wait_turnstile(page, total=25, tag='Turnstile(rewards)')
-    time.sleep(2)
     log('💰 ' + page_snippet(page, 260))
 
-    gen = find_btn_by_text(page, 'Generate reward')
-    if gen:
-        human_pause()
-        try:
-            gen.click()
-        except Exception:
-            js_click_btn_with_text(page, 'Generate reward')
-    elif not js_click_btn_with_text(page, 'Generate reward'):
-        log('ℹ️ 未找到 "Generate reward" 按钮 (可能冷却/达每日上限)。URL: ' + (page.url or ''))
-        log('页面文本: ' + page_snippet(page, 500))
-        shot(page, 'rewards_no_generate')
-        return False
-    log('🪙 已点击 Generate reward')
+    # Generate reward 表单带 Cloudflare Turnstile, 必须先通过验证再点击;
+    # token 被服务端拒绝时会整页刷新出空的验证框, 需重新验证后重试 (最多 3 次)
+    gen_clicked = False
+    for attempt in range(1, 4):
+        if not turnstile_ready(page, 'Turnstile(rewards#' + str(attempt) + ')',
+                               total=100 if attempt == 1 else 60):
+            shot(page, 'rewards_turnstile_fail_' + str(attempt))
+            log('❌ rewards 页 Turnstile 未通过, 放弃本轮')
+            return False
+        if attempt > 1:
+            # token 已被消费/过期, 刷新页面重新拿
+            page.get(REWARDS_URL)
+            time.sleep(4)
+            if not turnstile_ready(page, 'Turnstile(rewards#' + str(attempt) + ')', total=60):
+                shot(page, 'rewards_turnstile_fail_' + str(attempt))
+                return False
 
-    start = None
-    for _ in range(20):
-        time.sleep(2)
-        start = find_btn_by_text(page, 'Start reward')
+        gen = find_btn_by_text(page, 'Generate reward')
+        if gen:
+            human_pause()
+            try:
+                gen.click()
+            except Exception:
+                gen = None
+        if not gen and not js_click_btn_with_text(page, 'Generate reward'):
+            log('ℹ️ 未找到 "Generate reward" 按钮 (可能冷却/达每日上限)。URL: ' + (page.url or ''))
+            log('页面文本: ' + page_snippet(page, 500))
+            shot(page, 'rewards_no_generate')
+            return False
+        log('🪙 已点击 Generate reward' + (' (第 ' + str(attempt) + ' 次)' if attempt > 1 else ''))
+
+        # 表单 POST 会整页刷新; 若 token 被拒, 新页面里验证框无 token
+        start = None
+        for _ in range(10):
+            time.sleep(2)
+            start = find_btn_by_text(page, 'Start reward')
+            if start:
+                break
+        if not start and turnstile_present(page) and not get_turnstile_token(page):
+            log('⚠️ 第 ' + str(attempt) + ' 次点击后未出现 Start reward 且验证框已重置')
+            log('页面文本: ' + page_snippet(page, 300))
+            continue
+        if not start:
+            # 页面加载慢的情况再多等 10 秒
+            for _ in range(5):
+                time.sleep(2)
+                start = find_btn_by_text(page, 'Start reward')
+                if start:
+                    break
         if start:
+            gen_clicked = True
             break
-    if start:
-        human_pause()
-        try:
-            start.click()
-        except Exception:
-            if not js_click_btn_with_text(page, 'Start reward'):
-                start = None
+        log('❌ 点击 Generate reward 后未出现 Start reward。URL: ' + (page.url or ''))
+        log('页面文本: ' + page_snippet(page, 500))
+        shot(page, 'rewards_no_start')
+        return False
+    if not gen_clicked:
+        shot(page, 'rewards_generate_exhausted')
+        log('❌ Generate reward 重试次数用尽')
+        return False
+
+    # Start reward 表单如果也带了验证组件, 同样先通过再点
+    if not turnstile_ready(page, 'Turnstile(start)', total=60):
+        shot(page, 'rewards_start_turnstile_fail')
+        log('❌ Start reward 前 Turnstile 未通过, 放弃本轮')
+        return False
+    human_pause()
+    try:
+        start.click()
+    except Exception:
+        if not js_click_btn_with_text(page, 'Start reward'):
+            start = None
     if not start:
-        log('ℹ️ 未出现 "Start reward" 按钮。URL: ' + (page.url or ''))
+        log('ℹ️ "Start reward" 点击失败。URL: ' + (page.url or ''))
         log('页面文本: ' + page_snippet(page, 500))
         shot(page, 'rewards_no_start')
         return False
@@ -914,9 +970,10 @@ def main():
         if DRY_RUN:
             page.get(REWARDS_URL)
             time.sleep(5)
+            turnstile_ready(page, 'Turnstile(rewards)', total=60)
             log('页面文本片段: ' + page_snippet(page, 500))
             shot(page, 'rewards_dryrun')
-            log('✅ DRY_RUN 完成: 登录与 rewards 页面访问正常')
+            log('✅ DRY_RUN 完成: 登录、rewards 页面与 Turnstile 正常')
             return
 
         total_ok = 0
