@@ -8,8 +8,8 @@ on:
         required: false
         default: '2'
   schedule:
-    # 每 3 小时运行一次 (UTC 时间, GitHub 定时任务可能有几分钟延迟)
-    - cron: '41 */3 * * *'
+    # 每天运行一次 (UTC 时间, GitHub 定时任务可能有几分钟延迟)
+    - cron: '41 3 * * *'
 
 permissions:
   contents: read
