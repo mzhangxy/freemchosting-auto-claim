@@ -7,12 +7,18 @@
   2. 处理 Cloudflare Turnstile (点击验证框, 等待 cf-turnstile-response token)
   3. 点击 Sign in 登录
   4. 进入 /rewards: 点击 Generate reward -> Start reward
-  5. 处理 LootLabs 任务流: 关闭广告弹窗 / 勾选验证 / 点击 Continue / 领取奖励
+  5. 处理 LootLabs 任务流:
+     - 任务行带 "~50 sec." 等时长标注 -> 点击后弹出的广告页保持 7 秒再关闭,
+       等任务在标注时间内自动完成 (正常 50~180 秒, 上限 240 秒)
+     - "CONFIRM YOU ARE HUMAN" 等验证任务 -> 自动点击 Turnstile
+     - 任务行既没有时长标注也不是验证类 -> 网站Bug, 永远不会完成,
+       立刻放弃本轮, 回 rewards 重新开始 (等待超过 360 秒无进展同样判定为卡死)
+     - 全部任务完成后点击 CLAIM REWARD / unlockBtn, 等待跳转回 FreeMC Hosting
 
 环境变量:
   MC_USERNAME, MC_PASSWORD   必填, 网站账号密码
-  MAX_ROUNDS                 领取轮数, 默认 2
-  LOOT_MAX_SECONDS           单轮 LootLabs 最长处理时间, 默认 480
+  MAX_ROUNDS                 领取轮数(含卡死重试), 默认 3
+  LOOT_MAX_SECONDS           单轮 LootLabs 最长处理时间, 默认 600
   DRY_RUN                    1 = 只验证登录并打开 rewards 页, 不实际领取
   SHOT_DIR                   截图目录, 默认 screenshots
 """
@@ -20,6 +26,7 @@
 import os
 import re
 import sys
+import json
 import time
 import random
 import shutil
@@ -39,13 +46,14 @@ REWARDS_URL = DASH + '/rewards'
 
 USERNAME = os.environ.get('MC_USERNAME', '')
 PASSWORD = os.environ.get('MC_PASSWORD', '')
-MAX_ROUNDS = int(os.environ.get('MAX_ROUNDS', '2') or '2')
-LOOT_MAX = int(os.environ.get('LOOT_MAX_SECONDS', '480') or '480')
+MAX_ROUNDS = int(os.environ.get('MAX_ROUNDS', '3') or '3')
+LOOT_MAX = int(os.environ.get('LOOT_MAX_SECONDS', '600') or '600')
 DRY_RUN = os.environ.get('DRY_RUN', '0') == '1'
 SHOT_DIR = os.environ.get('SHOT_DIR', 'screenshots')
 
 VERIFY_RE = re.compile(
-    r'confirm|human|验证|captcha|turnstile|hcaptcha|recaptcha|video|视频|watch|观看', re.I)
+    r'confirm|human|验证|captcha|turnstile|hcaptcha|recaptcha', re.I)
+DUR_RE = re.compile(r'[~～≈]\s*(\d+)\s*(sec|秒|s\b)', re.I)
 
 
 def log(msg):
@@ -55,8 +63,11 @@ def log(msg):
 def shot(scope, name):
     try:
         os.makedirs(SHOT_DIR, exist_ok=True)
-        scope.get_screenshot(path=SHOT_DIR, name=name, full_page=True)
-        log('📸 截图: ' + name + '.png')
+        try:
+            scope.get_screenshot(path=SHOT_DIR, name=name)
+        except Exception:
+            scope.get_screenshot(path=SHOT_DIR, name=name, full_page=True)
+        log('📸 截图: ' + name)
     except Exception as e:
         log('截图失败(' + name + '): ' + str(e))
 
@@ -89,6 +100,11 @@ def build_page():
     co.set_argument('--window-size=1360,900')
     co.set_argument('--lang=en-US')
     co.set_argument('--disable-blink-features=AutomationControlled')
+    # 关键: 禁止 Chrome 对"后台"窗口节流定时器, 否则 LootLabs 的任务倒计时永远走不完
+    co.set_argument('--disable-background-timer-throttling')
+    co.set_argument('--disable-backgrounding-occluded-windows')
+    co.set_argument('--disable-renderer-backgrounding')
+    co.set_argument('--disable-features=IntensiveWakeUpThrottling')
     page = ChromiumPage(co)
     try:
         page.set.timeouts(page_load=60, script=60)
@@ -133,6 +149,29 @@ return false;
     return js_bool(scope, script, text)
 
 
+TAG_BTN_JS = r"""
+const wanted = (arguments[0] || '').toUpperCase();
+document.querySelectorAll('[data-dp-claim-target]')
+        .forEach(e => e.removeAttribute('data-dp-claim-target'));
+const els = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+const el = els.find(e => e.offsetParent !== null &&
+                         (e.textContent || '').trim().toUpperCase().includes(wanted));
+if (!el) return false;
+el.setAttribute('data-dp-claim-target', '1');
+return true;
+"""
+
+
+def find_btn_by_text(scope, text):
+    """该站点的 DP 文本定位器失效, 用 JS 按文本找到按钮并打标记, 再用 CSS 定位做真实点击"""
+    if not js_bool(scope, TAG_BTN_JS, text):
+        return None
+    try:
+        return scope.ele('css:[data-dp-claim-target="1"]', timeout=5)
+    except Exception:
+        return None
+
+
 def click_continue(scope, tag, throttle):
     """每 2.5 秒最多点一次页面上可见的 Continue 按钮 (参考油猴脚本的强力点击循环)"""
     if time.time() - throttle[0] < 2.5:
@@ -152,6 +191,68 @@ return false;
         throttle[0] = time.time()
         return True
     return False
+
+
+def iter_frames(tab):
+    """枚举标签页内所有层级的 frame (顶层 + 嵌套 iframe), LootLabs 的任务界面可能在 iframe 里"""
+    out = []
+    seen = set()
+
+    def list_frames(scope):
+        fs = []
+        if hasattr(scope, 'get_frames'):
+            try:
+                fs = scope.get_frames() or []
+            except Exception:
+                fs = []
+        if not fs:
+            try:
+                for el in scope.eles('tag:iframe'):
+                    try:
+                        f = scope.get_frame(el)
+                        if f:
+                            fs.append(f)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return fs
+
+    def walk(scope, depth):
+        for f in list_frames(scope):
+            key = id(f)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(f)
+            if depth < 3:
+                walk(f, depth + 1)
+
+    walk(tab, 0)
+    return out
+
+
+def _tab_id(t):
+    try:
+        return t.tab_id
+    except Exception:
+        return id(t)
+
+
+def cleanup_tabs(page, keep_tid):
+    """一轮结束后关掉除 keep_tid 外的所有标签页"""
+    time.sleep(3)
+    try:
+        tids = list(page.tab_ids)
+    except Exception:
+        return
+    for tid in tids:
+        if tid == keep_tid:
+            continue
+        try:
+            page.get_tab(tid).close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -299,32 +400,40 @@ def do_login(page):
 # LootLabs 页面的 JS 片段
 # ---------------------------------------------------------------------------
 
-BLOCK_OPEN_JS = r"""
-if (!window.__origOpen) { window.__origOpen = window.open; }
-window.open = function () { return null; };
-return true;
-"""
-
-RESTORE_OPEN_JS = r"""
-if (window.__origOpen) { window.open = window.__origOpen; window.__origOpen = null; }
-return true;
-"""
-
-LOOT_PEEK_JS = r"""
+# 找到第一个待办任务: 返回行文本, 并给行右侧的箭头按钮(真正触发任务的元素)打标记
+LOOT_TASK_PICK_JS = r"""
+document.querySelectorAll('[data-dp-task-arrow]')
+        .forEach(e => e.removeAttribute('data-dp-task-arrow'));
 const idle = document.querySelector('.task-ind.ind-idle');
 if (!idle) return '';
 const task = idle.closest('.task') || idle.parentElement;
-return (task && task.textContent) ? task.textContent : 'task';
-"""
-
-LOOT_CLICK_TASK_JS = r"""
-const idle = document.querySelector('.task-ind.ind-idle');
-if (idle) { idle.click(); return true; }
-return false;
+const tr = task.getBoundingClientRect();
+const cands = Array.from(task.querySelectorAll('a, button, [role="button"], span, div, svg, i'))
+  .filter(e => {
+    if (e.offsetParent === null) return false;
+    const r = e.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && r.left > tr.left + tr.width * 0.55;
+  });
+cands.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+let arrow = cands.find(e => /^[→❯»>➔›⇒-]{1,2}$/.test((e.textContent || '').trim()));
+if (!arrow && cands.length) arrow = cands[0];
+if (arrow) arrow.setAttribute('data-dp-task-arrow', '1');
+return (task.textContent || '');
 """
 
 LOOT_IDLE_COUNT_JS = r"""
 return document.querySelectorAll('.task-ind.ind-idle').length;
+"""
+
+LOOT_SPIN_COUNT_JS = r"""
+return document.querySelectorAll('.task-ind.ind-spin').length;
+"""
+
+# 真实点击由 DP 完成(css 定位 .task-ind.ind-idle), 这里是 JS 兜底点击
+LOOT_CLICK_TASK_JS = r"""
+const idle = document.querySelector('.task-ind.ind-idle');
+if (idle) { idle.click(); return true; }
+return false;
 """
 
 LOOT_MODAL_JS = r"""
@@ -341,25 +450,35 @@ if (closeBtn) { closeBtn.click(); return 'closed'; }
 return 'modal';
 """
 
-# 判断领取按钮是否可点 (unlockBtn 可用 / Mission Complete / 按钮变成 go|is-success)
-LOOT_CLAIM_READY_JS = r"""
-const btn = document.getElementById('unlockBtn');
-const ready = document.getElementById('readyText');
-const vis = e => !!e && e.offsetParent !== null;
-const enabled = vis(btn) && !btn.disabled;
-const mission = vis(ready) && /Mission Complete/i.test(ready.textContent || '');
-const go = vis(btn) && (btn.classList.contains('go') || btn.classList.contains('is-success'));
-if (enabled || mission || go) return 'ready';
-return 'wait';
-"""
-
+# 无待办任务时: 点 unlockBtn(可用) 或 CLAIM REWARD 按钮 (锁定状态点了也无害)
 LOOT_CLAIM_CLICK_JS = r"""
 const btn = document.getElementById('unlockBtn');
-if (btn) { btn.click(); return 'btn'; }
-const alt = Array.from(document.querySelectorAll('button, a, div, span'))
-  .find(e => e.offsetParent !== null && /CLAIM\s*REWARD/i.test(e.textContent || ''));
-if (alt) { alt.click(); return 'alt'; }
+if (btn && btn.offsetParent !== null && !btn.disabled) { btn.click(); return 'unlock'; }
+const cr = Array.from(document.querySelectorAll('button, a, div, span'))
+  .find(e => e.offsetParent !== null &&
+             /CLAIM\s*REWARD/i.test((e.textContent || '').trim()) &&
+             (e.textContent || '').trim().length < 40);
+if (cr) { cr.click(); return 'claim'; }
 return '';
+"""
+
+LOOT_DIAG_JS = r"""
+return JSON.stringify({
+  idle: document.querySelectorAll('.task-ind.ind-idle').length,
+  spin: document.querySelectorAll('.task-ind.ind-spin').length,
+  done: (document.querySelectorAll('.task-ind').length -
+         document.querySelectorAll('.task-ind.ind-idle').length -
+         document.querySelectorAll('.task-ind.ind-spin').length),
+  unlock: (function(){var b=document.getElementById('unlockBtn');
+          return b ? ('disabled:' + b.disabled) : '';})(),
+  ready: (function(){var r=document.getElementById('readyText');
+          return r ? (r.textContent || '').trim().slice(0, 30) : '';})(),
+  cr: (function(){var e = Array.from(document.querySelectorAll('button, a, div'))
+       .find(function(x){return /CLAIM REWARD/i.test(x.textContent || '') &&
+                                 x.offsetParent !== null;});
+       return e ? e.tagName : '';})(),
+  ts: !!document.querySelector('iframe[src^="https://challenges.cloudflare.com"]')
+});
 """
 
 
@@ -367,212 +486,326 @@ return '';
 # LootLabs 流程
 # ---------------------------------------------------------------------------
 
-def _tab_id(t):
-    try:
-        return t.tab_id
-    except Exception:
-        return id(t)
+def classify_task(txt):
+    """返回 (类型, 等待上限秒): timed=带 ~50 sec. 时长标注; verify=人机验证; None=网站Bug任务"""
+    m = DUR_RE.search(txt or '')
+    if m:
+        return 'timed', 240
+    if txt and VERIFY_RE.search(txt):
+        return 'verify', 180
+    return None, 0
 
 
 def handle_popup(page, tab, tid, info, popups, claim_clicked_at, throttle):
-    """处理任务弹出的标签页: 验证弹窗点 Continue 后关闭, 广告弹窗 6 秒后关闭"""
+    """任务弹出的标签页: 广告页保持 7 秒再关闭(太短不计), 验证页点 Turnstile/Continue 后关闭"""
     try:
         if claim_clicked_at and time.time() - claim_clicked_at < 60:
             return  # 领取后打开的标签先不动
         age = time.time() - info['first_seen']
-        if info['verify']:
-            if turnstile_present(tab):
+        role = info.get('role', 'ad')
+        if role == 'verify':
+            if turnstile_present(tab) and not get_turnstile_token(tab):
                 click_turnstile(tab)
             if not info.get('continue_clicked'):
                 if click_continue(tab, 'verify-popup', throttle):
                     info['continue_clicked'] = time.time()
-            if info.get('continue_clicked') and time.time() - info['continue_clicked'] > 3:
+            if age > 170:
                 tab.close()
                 popups.pop(tid, None)
-                log('🧹 验证弹窗已处理并关闭')
-            elif age > 100:
-                tab.close()
-                popups.pop(tid, None)
-                log('🧹 验证弹窗超时, 强制关闭')
+                log('🧹 验证弹窗超时, 关闭')
         else:
-            if age > 6:
-                tab.close()
-                popups.pop(tid, None)
-                log('🧹 广告弹窗已关闭')
+            # 广告/定时任务弹窗: 保持 7 秒以上才有效, 关闭前顺手点一次 Continue
+            if age > 7:
+                if not info.get('grace') and click_continue(tab, 'popup', throttle):
+                    info['grace'] = time.time()
+                g = info.get('grace')
+                if not g or time.time() - g > 4:
+                    tab.close()
+                    popups.pop(tid, None)
+                    log('🧹 弹窗已保持足够时间, 关闭 (' + role + ')')
     except Exception:
         popups.pop(tid, None)
 
 
+def scope_diag(sc):
+    v = js_text(sc, LOOT_DIAG_JS)
+    try:
+        d = json.loads(v)
+        return 'idle=%s spin=%s done=%s %s %s cr=%s ts=%s' % (
+            d.get('idle'), d.get('spin'), d.get('done'),
+            d.get('unlock'), d.get('ready'), d.get('cr'), d.get('ts'))
+    except Exception:
+        return 'diag?'
+
+
 def run_lootlabs(page, tab):
+    """处理 LootLabs 任务流, 返回 'ok' | 'stuck'(Bug广告,需重开一轮) | 'fail'
+
+    任务状态用 idle/spin 计数判断: 点击后 idle 减少(进入 spin), spin 归零即完成。
+    """
     log('⏳ 开始处理 LootLabs 任务...')
     t0 = time.time()
+    dash_tid = _tab_id(page)
+    loot_tid = _tab_id(tab)
     popups = {}
+    task_popup_tid = None
+    in_task = False
+    task_cap = 0
+    task_started = 0.0
+    task_is_verify = False
+    idle_at_click = 0
+    spin_seen = False
+    prev_spin = -1
+    prev_idle = -1
+    reclicks = 0
+    last_progress = time.time()
+    claim_clicked_at = None
+    last_claim_click = 0.0
     cont_throttle = [0.0]
     popup_throttle = [0.0]
-    in_task = False
-    task_started_at = 0.0
-    task_is_verify = False
-    verify_until = 0.0
-    verify_popup_seen = False
-    claim_clicked_at = None
-    loot_tid = _tab_id(tab)
+    last_diag = 0.0
+    last_shot = 0.0
+
+    def totals(scs):
+        idle_n = spin_n = 0
+        for sc in scs:
+            idle_n += js_run(sc, LOOT_IDLE_COUNT_JS, 0) or 0
+            spin_n += js_run(sc, LOOT_SPIN_COUNT_JS, 0) or 0
+        return idle_n, spin_n
+
+    def dp_click_first_idle(scs):
+        for sc in scs:
+            try:
+                ind = sc.ele('css:.task-ind.ind-idle', timeout=1)
+                if ind:
+                    ind.click()
+                    return True
+            except Exception:
+                continue
+        return False
 
     while time.time() - t0 < LOOT_MAX:
         time.sleep(1.5)
 
-        # ---- 巡检所有标签页 ----
-        loot_tab_obj = None
+        # ---- 收集所有标签页: 处理弹窗 / 检测回跳 ----
         try:
             tids = list(page.tab_ids)
         except Exception:
             continue
         for tid in tids:
+            if tid in (loot_tid, dash_tid):
+                continue
             try:
                 t = page.get_tab(tid)
                 u = (t.url or '').lower()
             except Exception:
                 continue
-            if tid == loot_tid:
-                loot_tab_obj = t
-            elif 'lootlabs' not in u and 'freemchosting' not in u:
-                is_verify_popup = time.time() < verify_until and not verify_popup_seen
-                info = popups.setdefault(tid, {'first_seen': time.time(), 'verify': is_verify_popup})
-                if is_verify_popup:
-                    verify_popup_seen = True
-                handle_popup(page, t, tid, info, popups, claim_clicked_at, popup_throttle)
+            if 'freemchosting' in u and claim_clicked_at:
+                log('✅ 检测到 FreeMC Hosting 回跳标签页')
+                return 'ok'
+            if 'lootlabs' in u:
+                continue
+            if tid not in popups:
+                role = 'ad'
+                if in_task and task_popup_tid is None:
+                    role = 'verify' if task_is_verify else 'timed'
+                    task_popup_tid = tid
+                popups[tid] = {'first_seen': time.time(), 'role': role, 'continue_clicked': 0}
+                log('🪟 新弹窗 (' + role + '): ' + u[:80])
+                last_progress = time.time()
+            handle_popup(page, t, tid, popups[tid], popups, claim_clicked_at,
+                         popup_throttle)
 
-        if loot_tab_obj is None:
-            log('❌ LootLabs 标签页已关闭')
-            return False
+        if task_popup_tid and task_popup_tid not in popups:
+            task_popup_tid = None  # 弹窗已关闭, 下个任务的弹窗重新归类
 
+        # ---- loot 标签页状态 ----
         try:
-            cur = loot_tab_obj.url or ''
+            cur = tab.url or ''
         except Exception:
             continue
         cur_l = cur.lower()
 
-        # ---- 领取后跳转 = 本轮成功 ----
+        # 领取后跳转 = 成功
         if claim_clicked_at and 'lootlabs' not in cur_l:
             log('✅ 领取后页面已跳转: ' + cur[:120])
-            return True
+            return 'ok'
 
-        # ---- 任务中途被广告跳走 → 返回 ----
+        # 任务中途被广告跳走 -> 返回
         if 'lootlabs' not in cur_l:
             if 'freemchosting' in cur_l:
                 log('✅ 已回到 FreeMC Hosting')
-                return True
+                return 'ok'
             log('↩️ LootLabs 页面被跳转到: ' + cur[:100] + ' , 返回...')
             try:
-                loot_tab_obj.back()
+                tab.back()
             except Exception:
                 pass
             time.sleep(2)
             continue
 
-        # ---- lootlabs 页面常规处理 ----
-        modal = js_text(loot_tab_obj, LOOT_MODAL_JS)
-        if modal:
-            log('⚠️ 检测到 "Action not completed" 弹窗: ' + str(modal))
-            if modal == 'watch':
-                # 重新以验证模式尝试: 允许弹窗
-                verify_until = time.time() + 60
-                verify_popup_seen = False
-                in_task = False
-                js_run(loot_tab_obj, RESTORE_OPEN_JS)
+        # ---- 枚举 frame, 统计任务状态 ----
+        scopes = [tab] + iter_frames(tab)
+        idle_total, spin_total = totals(scopes)
+        if idle_total != prev_idle:
+            if prev_idle >= 0:
+                last_progress = time.time()
+            prev_idle = idle_total
 
-        click_continue(loot_tab_obj, 'lootlabs', cont_throttle)
+        now = time.time()
+        if now - last_diag > 30:
+            last_diag = now
+            log('📊 idle=%s spin=%s' % (idle_total, spin_total))
+            for sc in scopes:
+                try:
+                    su = (sc.url or '')[:70]
+                except Exception:
+                    su = '?'
+                log('🔍 [' + su + '] ' + scope_diag(sc))
+            log('📄 页面文本: ' + page_snippet(scopes[0], 200))
+        if now - last_shot > 60:
+            last_shot = now
+            shot(tab, 'loot_' + str(int(now - t0)) + 's')
 
-        if turnstile_present(loot_tab_obj) and not get_turnstile_token(loot_tab_obj):
-            click_turnstile(loot_tab_obj)
+        # ---- lootlabs 页面常规处理: 弹窗/Continue/Turnstile ----
+        for sc in scopes:
+            modal = js_text(sc, LOOT_MODAL_JS)
+            if modal:
+                log('⚠️ "Action not completed" 弹窗: ' + str(modal))
+                last_progress = time.time()
+            click_continue(sc, 'lootlabs', cont_throttle)
+            if turnstile_present(sc) and not get_turnstile_token(sc):
+                if click_turnstile(sc):
+                    last_progress = time.time()
 
-        idle_count = js_run(loot_tab_obj, LOOT_IDLE_COUNT_JS, 0) or 0
-        try:
-            idle_count = int(idle_count)
-        except Exception:
-            idle_count = 0
-
+        # ---- 任务状态轮询 (基于 idle/spin 计数) ----
+        task_done = False
         if in_task:
-            limit = 90 if task_is_verify else 25
-            if idle_count == 0 or time.time() - task_started_at > limit:
+            waited = time.time() - task_started
+            if spin_total > 0:
+                spin_seen = True
+                if spin_total != prev_spin:
+                    prev_spin = spin_total
+                    last_progress = time.time()
+            if idle_total < idle_at_click and spin_total == 0 and (spin_seen or waited > 25):
+                log('✅ 任务已完成 (等待 ' + str(int(waited)) + 's)')
                 in_task = False
-
-        if not in_task:
-            if idle_count > 0:
-                txt = js_text(loot_tab_obj, LOOT_PEEK_JS)
-                is_verify = bool(txt and VERIFY_RE.search(txt))
-                if not is_verify:
-                    js_run(loot_tab_obj, BLOCK_OPEN_JS)  # 广告任务: 阻止弹窗
-                if js_bool(loot_tab_obj, LOOT_CLICK_TASK_JS):
-                    in_task = True
-                    task_started_at = time.time()
-                    task_is_verify = is_verify
-                    if is_verify:
-                        verify_until = time.time() + 60
-                        verify_popup_seen = False
-                    kind = '[验证]' if is_verify else '[广告]'
-                    log('📌 点击任务 (剩 ' + str(idle_count) + ' 个): ' +
-                        kind + ' ' + (txt or 'task').strip().replace('\n', ' ')[:70])
-            else:
-                # 没有待办任务 → 尝试领取
-                state = js_text(loot_tab_obj, LOOT_CLAIM_READY_JS)
-                if state == 'ready':
-                    clicked = ''
-                    try:
-                        btn = loot_tab_obj.ele('#unlockBtn', timeout=2)
-                        if btn:
-                            btn.click()
-                            clicked = 'btn'
-                    except Exception:
-                        pass
+                task_done = True
+                last_progress = time.time()
+            elif waited > task_cap:
+                log('❌ 任务等待超过 ' + str(task_cap) + 's 仍未完成 -> 判定卡死, 重开一轮')
+                return 'stuck'
+            elif idle_total >= idle_at_click and spin_total == 0 and waited > 25:
+                # 点击没有生效, 重试
+                if reclicks < 2:
+                    reclicks += 1
+                    log('🔁 任务点击似乎未生效, 重试点击 (' + str(reclicks) + '/2)')
+                    clicked = dp_click_first_idle(scopes)
                     if not clicked:
-                        clicked = js_text(loot_tab_obj, LOOT_CLAIM_CLICK_JS)
+                        for sc in scopes:
+                            if js_bool(sc, LOOT_CLICK_TASK_JS):
+                                clicked = True
+                                break
                     if clicked:
-                        if not claim_clicked_at:
-                            claim_clicked_at = time.time()
-                            log('🎉 已点击领取按钮 (' + str(clicked) + '), 等待跳转...')
+                        task_started = time.time()
+                        idle_at_click = idle_total
+                        last_progress = time.time()
+                else:
+                    log('❌ 任务多次点击无效 -> 判定卡死, 重开一轮')
+                    return 'stuck'
 
-        if claim_clicked_at and time.time() - claim_clicked_at > 90:
-            log('⏰ 领取后长时间无跳转, 重试点击...')
-            claim_clicked_at = None
+            if task_done and task_popup_tid and task_popup_tid in popups:
+                try:
+                    page.get_tab(task_popup_tid).close()
+                except Exception:
+                    pass
+                popups.pop(task_popup_tid, None)
+                task_popup_tid = None
+                log('🧹 任务弹窗已关闭 (任务完成)')
 
-    shot(page, 'lootlabs_timeout')
+        # ---- 无进行中任务: 点下一个任务 / 尝试领取 ----
+        if not in_task:
+            pick = ''
+            pick_scope = None
+            for sc in scopes:
+                v = js_text(sc, LOOT_TASK_PICK_JS)
+                if v:
+                    pick = v
+                    pick_scope = sc
+                    break
+            if pick:
+                task_txt = pick
+                kind, _cap = classify_task(task_txt)
+                if kind is None:
+                    log('❌ 任务无时长标注且非验证类 (永不完成): ' +
+                        re.sub(r'\s+', ' ', task_txt).strip()[:60] + ' -> 重开一轮')
+                    return 'stuck'
+                # 优先点击行右侧的箭头按钮(真正触发任务的元素), 找不到再点指示器
+                clicked = False
+                try:
+                    arrow = pick_scope.ele('css:[data-dp-task-arrow="1"]', timeout=2)
+                    if arrow:
+                        arrow.click()
+                        clicked = True
+                        log('🖱️ 点击任务行右箭头')
+                except Exception:
+                    pass
+                if not clicked:
+                    clicked = dp_click_first_idle([pick_scope])
+                if not clicked:
+                    clicked = js_bool(pick_scope, LOOT_CLICK_TASK_JS)
+                if clicked:
+                    in_task = True
+                    task_started = time.time()
+                    task_is_verify = (kind == 'verify')
+                    task_cap = _cap
+                    idle_at_click = max(idle_total, 1)
+                    spin_seen = False
+                    prev_spin = -1
+                    reclicks = 0
+                    last_progress = time.time()
+                    log('📌 点击任务 [' + kind + ', 等待上限 ' + str(task_cap) + 's]: ' +
+                        re.sub(r'\s+', ' ', task_txt).strip()[:60])
+                else:
+                    log('⚠️ 任务点击失败, 下轮重试')
+            elif idle_total == 0 and spin_total == 0:
+                # 无待办任务 -> 尝试领取 (8 秒节流)
+                if claim_clicked_at is None or now - last_claim_click > 8:
+                    for sc in scopes:
+                        res = js_text(sc, LOOT_CLAIM_CLICK_JS)
+                        if res:
+                            last_claim_click = time.time()
+                            last_progress = time.time()
+                            if claim_clicked_at is None:
+                                claim_clicked_at = time.time()
+                                log('🎉 已点击领取按钮 (' + str(res) + '), 等待跳转...')
+                            else:
+                                log('🔁 重复点击领取按钮 (' + str(res) + ')')
+                            break
+
+        # ---- 卡死保护: 360 秒无任何进展 ----
+        if time.time() - last_progress > 360:
+            log('❌ 超过 360 秒无任何进展 -> 判定卡死, 重开一轮')
+            return 'stuck'
+
+    shot(tab, 'lootlabs_timeout')
     log('⚠️ LootLabs 处理超时 (' + str(LOOT_MAX) + 's)')
-    return False
+    return 'fail'
 
 
 # ---------------------------------------------------------------------------
 # Rewards 页面领取一轮
 # ---------------------------------------------------------------------------
 
-TAG_BTN_JS = r"""
-const wanted = (arguments[0] || '').toUpperCase();
-document.querySelectorAll('[data-dp-claim-target]')
-        .forEach(e => e.removeAttribute('data-dp-claim-target'));
-const els = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
-const el = els.find(e => e.offsetParent !== null &&
-                         (e.textContent || '').trim().toUpperCase().includes(wanted));
-if (!el) return false;
-el.setAttribute('data-dp-claim-target', '1');
-return true;
-"""
-
-
-def find_btn_by_text(scope, text):
-    """该站点的 DP 文本定位器失效, 用 JS 按文本找到按钮并打标记, 再用 CSS 定位做真实点击"""
-    if not js_bool(scope, TAG_BTN_JS, text):
-        return None
-    try:
-        return scope.ele('css:[data-dp-claim-target="1"]', timeout=5)
-    except Exception:
-        return None
-
-
 def claim_round(page):
+    """返回 True=领取成功, 'stuck'=遇到Bug广告需重开一轮, False=无法继续"""
+    dash_tid = _tab_id(page)
     log('🧭 打开 Rewards 页面: ' + REWARDS_URL)
     page.get(REWARDS_URL)
     time.sleep(4)
     wait_turnstile(page, total=25, tag='Turnstile(rewards)')
     time.sleep(2)
+    log('💰 ' + page_snippet(page, 260))
 
     gen = find_btn_by_text(page, 'Generate reward')
     if gen:
@@ -582,7 +815,7 @@ def claim_round(page):
         except Exception:
             js_click_btn_with_text(page, 'Generate reward')
     elif not js_click_btn_with_text(page, 'Generate reward'):
-        log('ℹ️ 未找到 "Generate reward" 按钮 (可能冷却中)。URL: ' + (page.url or ''))
+        log('ℹ️ 未找到 "Generate reward" 按钮 (可能冷却/达每日上限)。URL: ' + (page.url or ''))
         log('页面文本: ' + page_snippet(page, 500))
         shot(page, 'rewards_no_generate')
         return False
@@ -635,9 +868,17 @@ def claim_round(page):
         return False
 
     log('🎯 LootLabs 已打开: ' + (loot_tab.url or '')[:120])
-    ok = run_lootlabs(page, loot_tab)
-    log('✅ 本轮 LootLabs 流程完成' if ok else '⚠️ 本轮 LootLabs 流程未确认完成')
-    return ok
+    try:
+        res = run_lootlabs(page, loot_tab)
+    finally:
+        cleanup_tabs(page, dash_tid)
+    if res == 'ok':
+        log('✅ 本轮 LootLabs 流程完成')
+    elif res == 'stuck':
+        log('♻️ 本轮遇到卡死广告, 将重新开始')
+    else:
+        log('⚠️ 本轮 LootLabs 流程未确认完成')
+    return {'ok': True, 'stuck': 'stuck', 'fail': False}[res]
 
 
 # ---------------------------------------------------------------------------
@@ -678,17 +919,19 @@ def main():
         for r in range(1, MAX_ROUNDS + 1):
             log('===== 第 ' + str(r) + '/' + str(MAX_ROUNDS) + ' 轮领取 =====')
             try:
-                ok = claim_round(page)
+                res = claim_round(page)
             except Exception as e:
                 log('本轮异常: ' + str(e))
                 traceback.print_exc()
                 shot(page, 'round_' + str(r) + '_error')
-                ok = False
-            if ok:
+                res = False
+            if res is True:
                 total_ok += 1
                 time.sleep(20)  # 冷却 15 秒后再开下一轮
+            elif res == 'stuck':
+                continue  # 卡死轮不计冷却, 立刻重开
             else:
-                log('本轮未成功, 停止后续轮次')
+                log('本轮无法继续 (冷却/上限), 结束循环')
                 break
 
         shot(page, 'final')
