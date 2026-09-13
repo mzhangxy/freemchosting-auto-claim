@@ -11,7 +11,9 @@
   5. 处理 LootLabs 任务流:
      - 任务行带 "~50 sec." 等时长标注 -> 点击后弹出的广告页保持 7 秒再关闭,
        等任务在标注时间内自动完成 (正常 50~180 秒, 上限 240 秒)
-     - "CONFIRM YOU ARE HUMAN" 等验证任务 -> 自动点击 Turnstile
+     - "CONFIRM YOU ARE HUMAN" 等验证任务 -> 验证页嵌在第三方 iframe 里 (内含 Turnstile,
+       通过后还要点它的 Continue 按钮才会完成验证), 自动深度枚举 frame 逐个处理,
+       组件渲染失败自动重载; 独立验证弹窗同样处理
      - 任务行既没有时长标注也不是验证类 -> 网站Bug, 永远不会完成,
        立刻放弃本轮, 回 rewards 重新开始 (等待超过 360 秒无进展同样判定为卡死)
      - 全部任务完成后点击 CLAIM REWARD / unlockBtn, 等待跳转回 FreeMC Hosting
@@ -347,6 +349,104 @@ def turnstile_ready(scope, tag, total=100):
 
 
 # ---------------------------------------------------------------------------
+# LootLabs 验证任务的 captcha (嵌在页面里的第三方 iframe, 内含 Turnstile + Continue)
+# ---------------------------------------------------------------------------
+
+def probe_captcha(scope):
+    """探测一个 frame/tab 是否是验证组件载体, 返回状态 dict 或 None(不可探测)"""
+    v = js_run(scope, CAPTCHA_PROBE_JS, None)
+    if not isinstance(v, str) or not v.startswith('{'):
+        return None
+    try:
+        return json.loads(v)
+    except Exception:
+        return None
+
+
+def click_captcha_continue(scope):
+    """点击验证页的 Continue(#go): Turnstile 通过后必须点它才会 POST 完成验证"""
+    if js_bool(scope, CAPTCHA_GO_CLICK_JS):
+        log('🖱️ 点击验证页 Continue')
+        return True
+    return False
+
+
+def solve_captcha_frame(scope, state, label):
+    """处理单个验证 frame: 点 Turnstile -> 点 Continue, 渲染失败则重载 (每 frame 最多 2 次)"""
+    st = probe_captcha(scope)
+    if not st:
+        return False
+    is_gate = bool(st.get('widget') or st.get('ts') or st.get('hc'))
+    if not is_gate:
+        return False
+
+    acted = False
+    url = ''
+    try:
+        url = (scope.url or '').split('?')[0]
+    except Exception:
+        pass
+
+    if st.get('done'):
+        return False  # 已验证完成
+
+    # 1) 还没 token: 点验证框 (Turnstile/hCaptcha)
+    if not st.get('token') and (st.get('ts') or st.get('hc')):
+        if click_turnstile(scope):
+            acted = True
+            state['last_act'] = time.time()
+
+    # 2) token 就绪/按钮可用: 点 Continue
+    if (st.get('token') or st.get('go') == 1 or st.get('btn') == 1) and \
+            time.time() - state.get('last_go', 0) > 3:
+        if click_captcha_continue(scope):
+            acted = True
+            state['last_go'] = time.time()
+            state['last_act'] = time.time()
+
+    # 3) 组件在但 Turnstile 一直没渲染/报错 → 重载整个验证 frame
+    if not st.get('token') and st.get('widget') and not st.get('ts') and not st.get('hc'):
+        key = url or 'gate'
+        e = state.setdefault(key, {'n': 0, 'since': time.time()})
+        if st.get('err') or time.time() - e['since'] > 25:
+            if e['n'] < 2:
+                e['n'] += 1
+                e['since'] = time.time()
+                log('🔁 重载验证 frame (' + str(e['n']) + '/2): ' + url[:60])
+                js_run(scope, 'location.reload();')
+                acted = True
+                state['last_act'] = time.time()
+
+    # 周期性状态日志 (每 ~12s)
+    if time.time() - state.get('last_log', 0) > 12:
+        state['last_log'] = time.time()
+        log('🛡️ 验证组件状态 [%s]: widget=%s ts=%s hc=%s token=%s go=%s btn=%s err=%s' %
+            (label, st.get('widget'), st.get('ts'), st.get('hc'), st.get('token'),
+             st.get('go'), st.get('btn'), st.get('err')))
+    return acted
+
+
+def solve_captcha_frames(tab, state):
+    """枚举 loot 标签页所有层的 frame 找验证组件并处理。返回 (是否有验证进行中, 是否有动作)"""
+    acted = False
+    gate = False
+    for idx, sc in enumerate([tab] + iter_frames(tab)):
+        try:
+            u = (sc.url or '').lower()
+        except Exception:
+            continue
+        if any(d in u for d in ('lootlabs', 'freemchosting', 'challenges.cloudflare',
+                                'stripe', 'youtube', 'google')):
+            continue  # 主页面/广告/支付帧不在这里处理
+        if solve_captcha_frame(sc, state, 'frame' + str(idx)):
+            acted = True
+        st = probe_captcha(sc)
+        if st and (st.get('widget') or st.get('ts') or st.get('hc')):
+            gate = True
+    return gate, acted
+
+
+# ---------------------------------------------------------------------------
 # 登录
 # ---------------------------------------------------------------------------
 
@@ -502,6 +602,53 @@ return JSON.stringify({
 });
 """
 
+# 验证任务会把第三方 captcha 页 (如 nerventualken.com/captcha) 嵌进 lootlabs 页面:
+# 里面是一个 Cloudflare Turnstile, 通过后还要点它的 Continue(#go) 按钮才会 POST 完成验证
+CAPTCHA_PROBE_JS = r"""
+return JSON.stringify({
+  widget: !!document.querySelector('.cf-turnstile, [class*="turnstile"]'),
+  ts: !!document.querySelector('iframe[src^="https://challenges.cloudflare.com"]'),
+  hc: !!(document.querySelector('iframe[src*="hcaptcha.com"]') ||
+         document.querySelector('iframe[title*="hCaptcha" i]')),
+  token: (function(){
+    var els = document.querySelectorAll('[name="cf-turnstile-response"], [name="g-recaptcha-response"], [name="h-captcha-response"]');
+    for (var i = 0; i < els.length; i++) { if (els[i].value && els[i].value.length > 10) return 1; }
+    return 0;})(),
+  go: (function(){var b = document.getElementById('go');
+       return b ? (b.disabled ? 0 : 1) : -1;})(),
+  btn: (function(){
+    var b = Array.from(document.querySelectorAll('button, a')).find(function(x){
+      return x.offsetParent !== null && !x.disabled &&
+             /^continue\b/i.test((x.textContent || '').trim()) &&
+             (x.textContent || '').trim().length < 30;});
+    return b ? 1 : 0;})(),
+  err: (function(){
+    var t = (document.body && document.body.innerText) || '';
+    return /could not load the check|verification failed|check expired/i.test(t) ? 1 : 0;})(),
+  done: (function(){
+    var t = (document.body && document.body.innerText) || '';
+    return /verified|you can close/i.test(t) ? 1 : 0;})()
+});
+"""
+
+CAPTCHA_GO_CLICK_JS = r"""
+var b = document.getElementById('go');
+if (b && !b.disabled && (b.textContent || '').trim() !== 'Done') { b.click(); return 'go'; }
+var c = Array.from(document.querySelectorAll('button, a')).find(function(x){
+  return x.offsetParent !== null && !x.disabled &&
+         /^continue\b/i.test((x.textContent || '').trim()) &&
+         (x.textContent || '').trim().length < 30;});
+if (c) { c.click(); return 'continue'; }
+return '';
+"""
+
+# 把进行中/待办的任务行滚进视口, 方便截图观察验证组件
+SCROLL_TASK_JS = r"""
+var t = document.querySelector('.task-ind.ind-spin') || document.querySelector('.task-ind.ind-idle');
+if (t) { var row = t.closest('.task') || t; row.scrollIntoView({block: 'center'}); return true; }
+return false;
+"""
+
 
 # ---------------------------------------------------------------------------
 # LootLabs 流程
@@ -525,11 +672,19 @@ def handle_popup(page, tab, tid, info, popups, claim_clicked_at, throttle):
         age = time.time() - info['first_seen']
         role = info.get('role', 'ad')
         if role == 'verify':
-            if turnstile_present(tab) and not get_turnstile_token(tab):
-                click_turnstile(tab)
-            if not info.get('continue_clicked'):
-                if click_continue(tab, 'verify-popup', throttle):
-                    info['continue_clicked'] = time.time()
+            st = probe_captcha(tab)
+            if st and (st.get('widget') or st.get('ts') or st.get('hc')):
+                # 弹窗本身是验证页: 点 Turnstile -> 点 Continue
+                if not st.get('token') and (st.get('ts') or st.get('hc')):
+                    click_turnstile(tab)
+                if (st.get('token') or st.get('go') == 1 or st.get('btn') == 1) and \
+                        time.time() - info.get('last_go', 0) > 3:
+                    if click_captcha_continue(tab):
+                        info['last_go'] = time.time()
+            else:
+                if not info.get('continue_clicked'):
+                    if click_continue(tab, 'verify-popup', throttle):
+                        info['continue_clicked'] = time.time()
             if age > 170:
                 tab.close()
                 popups.pop(tid, None)
@@ -587,6 +742,7 @@ def run_lootlabs(page, tab):
     blocked_first = 0.0
     blocked_last_reload = 0.0
     blocked_reloads = 0
+    captcha_state = {}
     last_diag = 0.0
     last_shot = 0.0
 
@@ -717,16 +873,24 @@ def run_lootlabs(page, tab):
             last_shot = now
             shot(tab, 'loot_' + str(int(now - t0)) + 's')
 
-        # ---- lootlabs 页面常规处理: 弹窗/Continue/Turnstile ----
+        # ---- lootlabs 页面常规处理: 弹窗 / 验证 captcha / Continue ----
         for sc in scopes:
             modal = js_text(sc, LOOT_MODAL_JS)
             if modal:
                 log('⚠️ "Action not completed" 弹窗: ' + str(modal))
                 last_progress = time.time()
-            click_continue(sc, 'lootlabs', cont_throttle)
-            if turnstile_present(sc) and not get_turnstile_token(sc):
-                if click_turnstile(sc):
-                    last_progress = time.time()
+        gate, cap_acted = solve_captcha_frames(tab, captcha_state)
+        if gate:
+            # 验证进行中: 把任务行滚进视口便于截图观察
+            js_run(tab, SCROLL_TASK_JS)
+            if cap_acted:
+                last_progress = time.time()
+        else:
+            for sc in scopes:
+                click_continue(sc, 'lootlabs', cont_throttle)
+                if turnstile_present(sc) and not get_turnstile_token(sc):
+                    if click_turnstile(sc):
+                        last_progress = time.time()
 
         # ---- 任务状态轮询 (基于 idle/spin 计数) ----
         task_done = False
