@@ -46,6 +46,7 @@ REWARDS_URL = DASH + '/rewards'
 
 USERNAME = os.environ.get('MC_USERNAME', '')
 PASSWORD = os.environ.get('MC_PASSWORD', '')
+PROXY = os.environ.get('CLAIM_PROXY', '')  # 可选住宅代理, 如 http://user:pass@ip:port
 MAX_ROUNDS = int(os.environ.get('MAX_ROUNDS', '3') or '3')
 LOOT_MAX = int(os.environ.get('LOOT_MAX_SECONDS', '600') or '600')
 DRY_RUN = os.environ.get('DRY_RUN', '0') == '1'
@@ -93,6 +94,9 @@ def build_page():
               or shutil.which('chrome'))
     if chrome:
         co.set_browser_path(chrome)
+    if PROXY:
+        co.set_proxy(PROXY)
+        log('🌐 使用代理: ' + PROXY)
     co.auto_port(True)
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-dev-shm-usage')

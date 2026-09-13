@@ -1,0 +1,45 @@
+# 在自己的电脑上运行 (自托管 runner), 家庭宽带 IP 不会被 LootLabs 屏蔽
+# 前提: 机器上已装 Python、Chrome, 并按 GitHub 文档添加 self-hosted runner
+name: Auto Claim Credits (Self-hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_rounds:
+        description: '领取轮数'
+        required: false
+        default: '2'
+
+concurrency:
+  group: claim-credits-selfhosted
+  cancel-in-progress: false
+
+jobs:
+  claim:
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        shell: bash
+        run: |
+          python -m pip install -q -r requirements.txt || python -m pip install -q DrissionPage
+
+      - name: Run auto claim
+        shell: bash
+        env:
+          MC_USERNAME: ${{ secrets.MC_USERNAME }}
+          MC_PASSWORD: ${{ secrets.MC_PASSWORD }}
+          MAX_ROUNDS: ${{ github.event.inputs.max_rounds || '2' }}
+        run: python claim.py
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-selfhosted-${{ github.run_id }}
+          path: screenshots/
+          if-no-files-found: ignore
+          retention-days: 7

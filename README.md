@@ -30,7 +30,11 @@
 
 ## 注意事项
 
-- **Cloudflare 风控**：GitHub Actions 的 IP 属于数据中心 IP，Cloudflare 可能给出更严格的验证。脚本会多次尝试点击验证框，如果仍然失败，可在 run 日志的截图中查看具体卡在哪一步。
+- **LootLabs 屏蔽数据中心 IP（重要）**：GitHub官方 runner 的 IP 属于数据中心 IP，LootLabs 会返回 "Packet blocked ... use of VPN" 直接拒绝加载任务页，导致云端领取失败（登录和每日上限检测都正常）。**本脚本已在家庭宽带网络下完整跑通**（登录 → 任务 → CF 验证 → 领取到账）。云端要用有两种办法：
+  1. 在 Secrets 里加一个 `CLAIM_PROXY`（住宅代理，格式 `http://user:pass@ip:port`），脚本会通过它访问；
+  2. 改用自托管 runner：在自己电脑上装 GitHub self-hosted runner，然后手动运行 **Auto Claim Credits (Self-hosted)** workflow（电脑需开机）。
+- **每日上限**： rewards 页每天最多 5 次生成机会，脚本检测到 "Generate reward" 按钮消失（次数用尽/冷却中）会自动停止。
+- **卡死重试**：任务行带 "~50 sec." 之类时长标注的会自动完成（正常 50~180 秒）；既无时长标注又不是验证类的任务属于网站 Bug（永远不会完成），脚本会立刻放弃本轮并重新开始；单任务等待超过 240 秒或全局 360 秒无进展同样重开。
 - **定时任务休眠**：GitHub 会在公共仓库 60 天无活动后自动暂停定时 workflow，届时手动 Run 一次或 push 一次即可恢复。
 - **公共仓库**：公共仓库的 Actions 分钟数免费不限量，账号密码只存在 Secrets 中，不会泄露。如改为私有仓库，请注意 GitHub 免费账户每月只有 2000 分钟额度。
 

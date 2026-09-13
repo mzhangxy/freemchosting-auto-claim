@@ -47,6 +47,7 @@ jobs:
         env:
           MC_USERNAME: ${{ secrets.MC_USERNAME }}
           MC_PASSWORD: ${{ secrets.MC_PASSWORD }}
+          CLAIM_PROXY: ${{ secrets.CLAIM_PROXY }}
           MAX_ROUNDS: ${{ github.event.inputs.max_rounds || '2' }}
         run: xvfb-run -a --server-args="-screen 0 1360x900x24" python claim.py
 
