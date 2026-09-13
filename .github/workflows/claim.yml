@@ -43,12 +43,18 @@ jobs:
           sudo apt-get install -y xvfb
           pip install -r requirements.txt
 
+      - name: 🌐 设置 sing-box 代理转发
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+      
       - name: Run auto claim
         env:
           MC_USERNAME: ${{ secrets.MC_USERNAME }}
           MC_PASSWORD: ${{ secrets.MC_PASSWORD }}
-          CLAIM_PROXY: ${{ secrets.CLAIM_PROXY }}
           MAX_ROUNDS: ${{ github.event.inputs.max_rounds || '2' }}
+          PROXY: socks5://127.0.0.1:1080
         run: xvfb-run -a --server-args="-screen 0 1360x900x24" python claim.py
 
       - name: Upload screenshots
