@@ -35,6 +35,8 @@ import random
 import shutil
 import traceback
 
+from urllib.parse import urlparse
+
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
@@ -405,15 +407,8 @@ def tick_captcha(scope, st, state):
     return clicked
 
 
-def solve_captcha_frame(scope, state, label):
+def solve_captcha_frame(scope, st, state, label):
     """处理单个验证 frame: 点 Turnstile -> 点 Continue, 渲染失败则重载 (每 frame 最多 2 次)"""
-    st = probe_captcha(scope)
-    if not st:
-        return False
-    is_gate = bool(st.get('widget') or st.get('ts') or st.get('hc'))
-    if not is_gate:
-        return False
-
     acted = False
     url = ''
     try:
@@ -426,8 +421,7 @@ def solve_captcha_frame(scope, state, label):
 
     # 1) 还没 token: 点验证框 (Turnstile 可能渲染在 shadow DOM 里)
     #    go/btn 可用说明 token 其实已就绪, 别再点复选框把已通过的验证重置
-    if not st.get('token') and not st.get('done') and \
-            st.get('go') != 1 and st.get('btn') != 1:
+    if not st.get('token') and st.get('go') != 1 and st.get('btn') != 1:
         if tick_captcha(scope, st, state):
             acted = True
             state['last_act'] = time.time()
@@ -441,10 +435,12 @@ def solve_captcha_frame(scope, state, label):
             state['last_act'] = time.time()
 
     # 3) 组件在但 Turnstile 一直没渲染/报错 → 重载整个验证 frame
-    if not st.get('token') and st.get('widget') and not st.get('ts') and not st.get('hc'):
+    #    刚点过复选框时给 Turnstile 留出评估时间, 不急着重载
+    if not st.get('token') and st.get('go') != 1 and st.get('widget'):
         key = url or 'gate'
         e = state.setdefault(key, {'n': 0, 'since': time.time()})
-        if st.get('err') or time.time() - e['since'] > 25:
+        recent_tick = time.time() - state.get('last_tick', 0) < 12
+        if not recent_tick and (st.get('err') or time.time() - e['since'] > 30):
             if e['n'] < 2:
                 e['n'] += 1
                 e['since'] = time.time()
@@ -462,23 +458,51 @@ def solve_captcha_frame(scope, state, label):
     return acted
 
 
-def solve_captcha_frames(tab, state):
-    """枚举 loot 标签页所有层的 frame 找验证组件并处理。返回 (是否有验证进行中, 是否有动作)"""
+CAPTCHA_SKIP_HOSTS = ('lootlabs', 'freemchosting', 'challenges.cloudflare',
+                      'stripe', 'youtube', 'google', 'doubleclick',
+                      'googlesyndication', 'about:blank')
+
+
+def solve_captcha_frames(tab, state, expect_gate=False):
+    """找验证 gate frame 并处理。返回 (是否有验证进行中, 是否有动作)
+
+    iter_frames 对深层跨域 iframe 的枚举不稳定, 所以一旦见过 gate 就按域名定向查找。
+    """
     acted = False
     gate = False
-    for idx, sc in enumerate([tab] + iter_frames(tab)):
+    seen = ''
+    cands = []
+    domain = state.get('gate_domain')
+    if domain:
+        try:
+            fr = tab.get_frame('css:iframe[src*="%s"]' % domain, timeout=2)
+            if fr is not None:
+                cands.append(fr)
+        except Exception:
+            pass
+    for sc in iter_frames(tab):
+        cands.append(sc)
+
+    for sc in cands:
         try:
             u = (sc.url or '').lower()
         except Exception:
             continue
-        if any(d in u for d in ('lootlabs', 'freemchosting', 'challenges.cloudflare',
-                                'stripe', 'youtube', 'google')):
-            continue  # 主页面/广告/支付帧不在这里处理
-        if solve_captcha_frame(sc, state, 'frame' + str(idx)):
-            acted = True
+        if not u or any(d in u for d in CAPTCHA_SKIP_HOSTS):
+            continue
+        seen += u[:60] + ' | '
         st = probe_captcha(sc)
         if st and (st.get('widget') or st.get('ts') or st.get('hc')):
             gate = True
+            if not domain:
+                state['gate_domain'] = urlparse(sc.url or '').netloc
+                log('🎯 找到验证 gate: ' + (sc.url or '')[:80])
+            if solve_captcha_frame(sc, st, state, 'gate'):
+                acted = True
+    if expect_gate and not gate:
+        if time.time() - state.get('last_miss', 0) > 15:
+            state['last_miss'] = time.time()
+            log('🔍 未发现 gate frame, 外部 frame: ' + (seen.strip() or '无')[:150])
     return gate, acted
 
 
@@ -746,7 +770,7 @@ def classify_task(txt):
     if m:
         return 'timed', 240
     if txt and VERIFY_RE.search(txt):
-        return 'verify', 180
+        return 'verify', 240  # 验证 gate iframe 常延迟 1~2 分钟才生成, 上限留足
     return None, 0
 
 
@@ -966,7 +990,8 @@ def run_lootlabs(page, tab):
             if modal:
                 log('⚠️ "Action not completed" 弹窗: ' + str(modal))
                 last_progress = time.time()
-        gate, cap_acted = solve_captcha_frames(tab, captcha_state)
+        gate, cap_acted = solve_captcha_frames(tab, captcha_state,
+                                               expect_gate=in_task and task_is_verify)
         if gate:
             # 验证进行中: 把任务行滚进视口便于截图观察
             js_run(tab, SCROLL_TASK_JS)
@@ -1062,6 +1087,9 @@ def run_lootlabs(page, tab):
                     task_cap = _cap
                     idle_at_click = max(idle_total, 1)
                     spin_seen = False
+                    if task_is_verify:
+                        # 验证 gate iframe 往往等任务行可见才加载, 先滚进视口
+                        js_run(tab, SCROLL_TASK_JS)
                     prev_spin = -1
                     reclicks = 0
                     last_progress = time.time()
