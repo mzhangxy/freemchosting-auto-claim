@@ -371,6 +371,40 @@ def click_captcha_continue(scope):
     return False
 
 
+def click_turnstile_widget(scope):
+    """shadow DOM 场景: 对 .cf-turnstile 容器坐标做真实点击 (复选框在容器左侧 ~30px)"""
+    ox, oy = 30, 33
+    r = js_run(scope, CAPTCHA_WIDGET_RECT_JS, None)
+    if isinstance(r, str) and r.startswith('{'):
+        try:
+            d = json.loads(r)
+            if d.get('w') and d.get('h'):
+                oy = max(12, int(d['h'] / 2))
+        except Exception:
+            pass
+    try:
+        w = scope.ele('css:.cf-turnstile, [class*="turnstile"]', timeout=3)
+        if w:
+            w.click.at(offset_x=ox, offset_y=oy)
+            log('🛡️ 已按坐标点击 Turnstile 复选框 (shadow DOM)')
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def tick_captcha(scope, st, state):
+    """未拿到 token 时点击验证框: light-DOM 走常规路径, shadow DOM 按容器坐标点击"""
+    if time.time() - state.get('last_tick', 0) < 15:
+        return False
+    clicked = click_turnstile(scope) if st.get('ts') else False
+    if not clicked and (st.get('widget') or st.get('ts')):
+        clicked = click_turnstile_widget(scope)
+    if clicked:
+        state['last_tick'] = time.time()
+    return clicked
+
+
 def solve_captcha_frame(scope, state, label):
     """处理单个验证 frame: 点 Turnstile -> 点 Continue, 渲染失败则重载 (每 frame 最多 2 次)"""
     st = probe_captcha(scope)
@@ -390,9 +424,11 @@ def solve_captcha_frame(scope, state, label):
     if st.get('done'):
         return False  # 已验证完成
 
-    # 1) 还没 token: 点验证框 (Turnstile/hCaptcha)
-    if not st.get('token') and (st.get('ts') or st.get('hc')):
-        if click_turnstile(scope):
+    # 1) 还没 token: 点验证框 (Turnstile 可能渲染在 shadow DOM 里)
+    #    go/btn 可用说明 token 其实已就绪, 别再点复选框把已通过的验证重置
+    if not st.get('token') and not st.get('done') and \
+            st.get('go') != 1 and st.get('btn') != 1:
+        if tick_captcha(scope, st, state):
             acted = True
             state['last_act'] = time.time()
 
@@ -607,13 +643,32 @@ return JSON.stringify({
 CAPTCHA_PROBE_JS = r"""
 return JSON.stringify({
   widget: !!document.querySelector('.cf-turnstile, [class*="turnstile"]'),
-  ts: !!document.querySelector('iframe[src^="https://challenges.cloudflare.com"]'),
+  ts: (function(){
+    function deep(root){
+      var els = root.querySelectorAll('iframe');
+      for (var i = 0; i < els.length; i++) {
+        if (/^https:\/\/challenges\.cloudflare\.com/.test(els[i].src || '')) return true;
+      }
+      var all = root.querySelectorAll('*');
+      for (var j = 0; j < all.length; j++) {
+        if (all[j].shadowRoot && deep(all[j].shadowRoot)) return true;
+      }
+      return false;
+    }
+    return deep(document);})(),
   hc: !!(document.querySelector('iframe[src*="hcaptcha.com"]') ||
          document.querySelector('iframe[title*="hCaptcha" i]')),
   token: (function(){
-    var els = document.querySelectorAll('[name="cf-turnstile-response"], [name="g-recaptcha-response"], [name="h-captcha-response"]');
-    for (var i = 0; i < els.length; i++) { if (els[i].value && els[i].value.length > 10) return 1; }
-    return 0;})(),
+    function deep(root){
+      var els = root.querySelectorAll('[name="cf-turnstile-response"], [name="g-recaptcha-response"], [name="h-captcha-response"]');
+      for (var i = 0; i < els.length; i++) { if (els[i].value && els[i].value.length > 10) return 1; }
+      var all = root.querySelectorAll('*');
+      for (var j = 0; j < all.length; j++) {
+        if (all[j].shadowRoot && deep(all[j].shadowRoot)) return 1;
+      }
+      return 0;
+    }
+    return deep(document);})(),
   go: (function(){var b = document.getElementById('go');
        return b ? (b.disabled ? 0 : 1) : -1;})(),
   btn: (function(){
@@ -629,6 +684,37 @@ return JSON.stringify({
     var t = (document.body && document.body.innerText) || '';
     return /verified|you can close/i.test(t) ? 1 : 0;})()
 });
+"""
+
+# Turnstile 的挑战 iframe 渲染在 .cf-turnstile 容器的 shadow DOM 里, frame 查找拿不到;
+# 先尝试穿透 shadow root 拿挑战 iframe 的精确位置, 拿不到就退回容器本身
+# (标准 300x65 组件的复选框在容器左侧约 30px 处)
+CAPTCHA_WIDGET_RECT_JS = r"""
+(function(){
+  function findIframe(root){
+    var els = root.querySelectorAll('iframe');
+    for (var i = 0; i < els.length; i++) {
+      if (/^https:\/\/challenges\.cloudflare\.com/.test(els[i].src || '')) {
+        var r = els[i].getBoundingClientRect();
+        return {x: r.x, y: r.y, w: r.width, h: r.height};
+      }
+    }
+    var all = root.querySelectorAll('*');
+    for (var j = 0; j < all.length; j++) {
+      if (all[j].shadowRoot) {
+        var f = findIframe(all[j].shadowRoot);
+        if (f) return f;
+      }
+    }
+    return null;
+  }
+  var f = findIframe(document);
+  if (!f) {
+    var w = document.querySelector('.cf-turnstile, [class*="turnstile"]');
+    if (w) { var r = w.getBoundingClientRect(); f = {x: r.x, y: r.y, w: r.width, h: r.height}; }
+  }
+  return f ? JSON.stringify(f) : '';
+})()
 """
 
 CAPTCHA_GO_CLICK_JS = r"""
@@ -675,8 +761,9 @@ def handle_popup(page, tab, tid, info, popups, claim_clicked_at, throttle):
             st = probe_captcha(tab)
             if st and (st.get('widget') or st.get('ts') or st.get('hc')):
                 # 弹窗本身是验证页: 点 Turnstile -> 点 Continue
-                if not st.get('token') and (st.get('ts') or st.get('hc')):
-                    click_turnstile(tab)
+                if not st.get('token') and not st.get('done') and \
+                        st.get('go') != 1 and st.get('btn') != 1:
+                    tick_captcha(tab, st, info)
                 if (st.get('token') or st.get('go') == 1 or st.get('btn') == 1) and \
                         time.time() - info.get('last_go', 0) > 3:
                     if click_captcha_continue(tab):
