@@ -45,6 +45,6 @@
 pip install -r requirements.txt
 export MC_USERNAME=你的邮箱
 export MC_PASSWORD=你的密码
-DRY_RUN=1 python claim.py   # 只验证登录，不实际领取
+DRY_RUN=1 python claim.py   # 只验证登录，不实际领取 (注意: 网站对 DRY_RUN 也计每日次数, 并不免费)
 python claim.py             # 实际领取
 ```
